@@ -22,7 +22,7 @@ import {
   type FurnaceType,
 } from '@/types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '@/types/batch'
-import { LOW_REMAIN_KG, isLowRemain } from '@/utils/thermal'
+import { LOW_REMAIN_KG, DEFAULT_KILN_CAPACITY, isLowRemain } from '@/utils/thermal'
 import { today } from '@/utils/id'
 
 const store = useFurnaceStore()
@@ -46,6 +46,7 @@ const furnaceForm = reactive<FurnaceDraft>({
   maxTempC: 1250,
   fuelType: '燃气',
   state: '停窑',
+  capacity: DEFAULT_KILN_CAPACITY,
 })
 
 const batchForm = reactive<GlassBatchDraft>({
@@ -63,6 +64,7 @@ const furnaceRules: FormRules<FurnaceDraft> = {
   maxTempC: [{ required: true, message: '请填写最高温度', trigger: 'blur' }],
   fuelType: [{ required: true, message: '请选择燃料类型', trigger: 'change' }],
   state: [{ required: true, message: '请选择运行状态', trigger: 'change' }],
+  capacity: [{ required: true, message: '请填写退火窑装载容量（件）', trigger: 'blur' }],
 }
 
 const batchRules: FormRules<GlassBatchDraft> = {
@@ -104,6 +106,7 @@ function openCreateFurnace(): void {
     maxTempC: 1250,
     fuelType: '燃气' as FuelType,
     state: '停窑' as FurnaceState,
+    capacity: DEFAULT_KILN_CAPACITY,
   })
   furnaceDialog.value = true
 }
@@ -116,6 +119,7 @@ function openEditFurnace(row: Furnace): void {
     maxTempC: row.maxTempC,
     fuelType: row.fuelType,
     state: row.state,
+    capacity: row.type === '退火窑' ? row.capacity || DEFAULT_KILN_CAPACITY : 0,
   })
   furnaceDialog.value = true
 }
@@ -333,6 +337,12 @@ function handleFurnaceFilter(key: string, value: string): void {
         <el-table-column label="最高温度" width="110" align="right">
           <template #default="{ row }">{{ row.maxTempC }} ℃</template>
         </el-table-column>
+        <el-table-column label="装载容量" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="row.type === '退火窑'">{{ row.capacity }} 件/炉</span>
+            <span v-else class="cell-sub">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="料液批次" width="110" align="right">
           <template #default="{ row }">{{ store.statOf(row.id).batchCount }} 批</template>
         </el-table-column>
@@ -472,12 +482,16 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item v-if="furnaceForm.type === '退火窑'" label="装载容量（件）" prop="capacity">
+          <el-input-number v-model="furnaceForm.capacity" :min="1" :max="9" :step="1" style="width: 220px" />
+          <span class="cell-sub" style="margin-left: 10px">一炉最多并烧几件，排产按此封顶；物理窑位 A1–C3 共 9 格。</span>
+        </el-form-item>
         <el-alert
           v-if="furnaceForm.type === '退火窑'"
           type="success"
           show-icon
           :closable="false"
-          title="退火窑保存后会自动进入窑位池（A1–C3 共 9 个窑位），可在退火编排页分配。"
+          title="退火窑保存后进入窑位池：曲线相同、入窑时间对得上的待入窑作品可并成一炉，按装载容量封顶。"
         />
       </el-form>
       <template #footer>

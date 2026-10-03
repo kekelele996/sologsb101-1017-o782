@@ -9,6 +9,7 @@ import type { GlassBatch } from '../types/batch'
 import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
+import type { KilnRun } from '../types/run'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
@@ -67,13 +68,16 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     }
   }
+  // kilnruns 为 v3 新增：旧版存档可以没有，导入时按空数组兼容
   const keys: Array<keyof DatabaseSnapshot> = ['furnaces', 'batches', 'pieces', 'steps', 'anneals', 'inspects']
   for (const key of keys) {
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  const snapshot = data as DatabaseSnapshot
+  if (!Array.isArray(snapshot.kilnruns)) snapshot.kilnruns = []
+  return { ok: true, message: '存档校验通过。', snapshot }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -84,7 +88,9 @@ export function buildScheduleCsv(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  runs: KilnRun[] = [],
 ): string {
+  const runById = new Map(runs.map((run) => [run.id, run]))
   const header = [
     '作品名',
     '工艺',
@@ -98,7 +104,8 @@ export function buildScheduleCsv(
     '已完成工序',
     '累计工时(分钟)',
     '退火记录数',
-    '退火窑位',
+    '退火炉次',
+    '炉次窑位',
     '退火状态',
     '理论退火时长',
     '检验次数',
@@ -111,6 +118,7 @@ export function buildScheduleCsv(
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
+    const latestRun = latestAnneal?.runId ? runById.get(latestAnneal.runId) : undefined
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
     lines.push(
@@ -127,6 +135,7 @@ export function buildScheduleCsv(
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
+        latestRun ? `${latestRun.kilnCode} 第${latestRun.seq}炉` : latestAnneal?.kilnCode ?? '待排产',
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
@@ -148,9 +157,14 @@ export function exportScheduleCsvFile(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  runs: KilnRun[] = [],
 ): string {
   const filename = `玻璃窑务排产汇总-${stampSuffix()}.csv`
-  download(filename, buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects), 'text/csv;charset=utf-8')
+  download(
+    filename,
+    buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects, runs),
+    'text/csv;charset=utf-8',
+  )
   return filename
 }
 
@@ -200,7 +214,11 @@ export function buildStepCardText(
   if (anneals.length > 0) {
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      lines.push(
+        `  ${row.kilnCode}${row.kilnSlot === '' ? '' : ` · ${row.kilnSlot}`} · ${row.curveSeg} · 期望 ${row.expectedInAt} → ${
+          row.outAt || row.inAt || '待排产'
+        } · ${row.state}${row.runId === '' && row.state === '待入窑' ? '（排队中）' : ''}`,
+      )
     })
   }
   return lines.join('\n')

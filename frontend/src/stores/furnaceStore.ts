@@ -19,7 +19,7 @@ import {
   removeBatch,
   removeFurnace,
 } from '../utils/db'
-import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
+import { LOW_REMAIN_KG, DEFAULT_KILN_CAPACITY, isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
 /** 窑炉筛选条件 */
@@ -159,6 +159,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
       maxTempC: draft.maxTempC,
       fuelType: draft.fuelType,
       state: draft.state,
+      capacity: draft.type === '退火窑' ? Math.max(1, draft.capacity || DEFAULT_KILN_CAPACITY) : 0,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -180,6 +181,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
       maxTempC: draft.maxTempC,
       fuelType: draft.fuelType,
       state: draft.state,
+      capacity: draft.type === '退火窑' ? Math.max(1, draft.capacity || DEFAULT_KILN_CAPACITY) : 0,
     })
     revision.value += 1
   }

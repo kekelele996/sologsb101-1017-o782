@@ -1,7 +1,8 @@
 # 玻璃吹制工序与退火窑编排台（sologsb101-1017）
 
 面向玻璃工作室的窑务排产员：把每件作品的取料、吹制、塑形、开模、收口逐道工序排定，
-分配退火窑位与温度曲线，出炉检验并归档；窑位冲突时禁止提交，不合格自动生成返工提示。
+作品先进待入窑队列，再按炉次并炉排产（曲线相同、时间对齐的作品共用一组窑位、容量封顶），
+退火值守按炉次记实际入出炉与件数差异，出炉检验并归档；不合格自动生成返工提示。
 
 **纯前端单页应用**：无后端、无数据库服务、无 API 调用，数据全部保存在浏览器本地（IndexedDB），
 容器完全无状态、不挂载任何数据卷。
@@ -42,7 +43,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`；`v2 → v3` 新增退火炉次表与退火窑装载容量，旧退火记录迁为单件炉次 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -69,7 +70,7 @@ sologsb101-1017/
         ├── App.vue             # 外壳：顶部导航 + 当前作品上下文 + 页脚
         ├── env.d.ts
         ├── styles/main.css
-        ├── types/              # furnace.ts batch.ts piece.ts step.ts anneal.ts inspect.ts
+        ├── types/              # furnace.ts batch.ts piece.ts step.ts anneal.ts run.ts inspect.ts
         ├── stores/             # furnaceStore.ts pieceStore.ts annealStore.ts
         ├── components/common/  # StageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
@@ -87,7 +88,7 @@ sologsb101-1017/
 | `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
-| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
+| `/annealing` | `pages/AnnealingBoard.vue` | 退火炉次编排：待入窑队列、**按炉次自动并炉**（曲线相同+时间对齐、共用一组窑位、容量封顶）、撞炉留队列等下一炉、按炉次登记实际入窑/出炉与件数差异说明 |
 | `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
@@ -100,13 +101,18 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**退火按炉次编排 + 退火窑装载容量**：
+    * 新增 `kilnruns` 表（炉次：窑号、曲线指纹 `curveKey`、共用窑位 `slots`、计划/实际入出炉与件数、值守说明 `dutyNote`）；
+    * `anneals` 增加 `runId` 索引，并补 `kilnCode`（目标退火窑）与 `expectedInAt`（期望入窑时间）字段；
+    * `furnaces` 增加退火窑装载容量 `capacity`，旧数据缺失时**补默认值 9（件/炉）**；
+    * 升级时把每条旧退火记录迁成一个**单件炉次**（保留原窑位与入出炉时间），退火记录回挂对应炉次。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,15 +121,16 @@ sologsb101-1017/
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
+  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg, **runId** |
+  | `kilnruns` | id | furnaceId, kilnCode, state, curveKey, plannedInAt |
   | `inspects` | id | pieceId, date, result, inspector |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
   * 3 台窑炉（KILN-01 熔化炉 / KILN-02 坩埚炉 / AN-01 退火窑）；
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
-  * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
-  * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
+  * 5 件作品（覆盖四种状态与三种工艺）、18 道吹制工序（每件 2–5 道，seq 连续）；
+  * 5 条退火排队记录 + 3 个炉次（已出炉 ×2 / 退火中 ×1），另有两件壁厚均为 4.5 mm、期望入窑时间相差半小时的待入窑作品，点击「按炉次排产」即可演示并成一炉；
   * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
@@ -156,8 +163,15 @@ npm run preview      # 预览 dist 产物
   * 保温：560 ℃ 恒温，每 5 mm 壁厚保温 1.2 小时（壁厚越大保温越久）；
   * 缓冷：560 ℃ → 60 ℃，按 40 ℃/h。
   三段合计即该作品的**理论退火时长**，壁厚直接决定总时长。
-* **窑位占用判重**：同一窑位的时间窗 `[入窑, 出炉]` 重叠即判定冲突；未出炉时以「入窑 + 该曲线段理论时长」作为临时出炉时间参与判重。
-  **冲突时提交按钮禁用**并给出冲突的既有记录说明。
+* **炉次排产（按炉次并炉，`src/utils/run.ts` + `thermal.ts`）**
+  * 作品先进入**待入窑队列**：只选目标退火窑与期望入窑时间，窑位由排产统一分配；
+  * **曲线相同**（壁厚相同 → `curveKey` 指纹一致）且**入窑时间对得上**（相差 ≤ 1 小时）的待入窑作品**并成一炉**，整炉**共用一组窑位**，每件一格；
+  * 退火窑**装载容量按件数封顶**，装不下的切到（留在）队列**等下一炉**；同一台窑同一时间窗只能烧一条曲线，
+    新炉窗口撞上在烧 / 已编排炉时本次不排，**绝不挤掉已经入窑的那炉**；
+  * **退火值守按炉次登记实际入窑与出炉**：计划件（`planPieceIds`）与实际件（`actualPieceIds`）各留一份，
+    入窑未到场的件自动退回待入窑重排；**烧完件数对不上时必须在炉次 `dutyNote` 上说清**；
+  * **作品壁厚改动**：待入窑炉次解散、作品退回待入窑队列按新曲线**重新确认重排**（空炉自动删除），
+    **已经入窑（退火中 / 已出炉）的炉次按原样烧完**，不改曲线与窑位。
 * **温度单位换算**：℃ ↔ ℉（`cToF` / `fToC`）。
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。

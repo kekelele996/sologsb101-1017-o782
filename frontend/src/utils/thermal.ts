@@ -122,41 +122,63 @@ export function windowsOverlap(a: [number, number], b: [number, number]): boolea
   return a[0] < b[1] && b[0] < a[1]
 }
 
-export interface SlotConflict {
-  conflict: boolean
-  /** 冲突的既有退火记录 */
-  withPieceId: string
-  withAnnealId: string
-  message: string
+/* ------------------------------ 炉次排产 ------------------------------ */
+
+/**
+ * 退火窑默认装载容量（件数封顶）。
+ * 旧数据没有容量字段，数据库升级到 v3 时按此补默认值。
+ */
+export const DEFAULT_KILN_CAPACITY = 9
+
+/**
+ * 曲线指纹：退火曲线只由壁厚决定（升温 / 缓冷固定，保温按壁厚换算）。
+ * 指纹相同即视为「曲线相同」，才允许并成一炉。
+ */
+export function curveKeyOf(wallThicknessMm: number): string {
+  return String(round1(Math.max(0, wallThicknessMm)))
 }
 
 /**
- * 窑位占用判重：同一窑位、时间窗重叠即为冲突。
- * excludeAnnealId 用于编辑场景排除自身。
+ * 「时间能对上」的对齐容差：两件待入窑作品的期望入窑时间相差不超过该值，
+ * 才认为可以凑成同一炉（默认 60 分钟）。
  */
-export function checkSlotConflict(
-  existing: Anneal[],
-  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
-  wallThicknessOf: (pieceId: string) => number,
-  excludeAnnealId = '',
-): SlotConflict {
-  const ownThickness = wallThicknessOf(candidate.pieceId)
-  const ownWindow = annealWindow(candidate, ownThickness)
+export const ALIGN_TOLERANCE_MS = 60 * 60 * 1000
 
-  for (const row of existing) {
-    if (row.id === excludeAnnealId) continue
-    if (row.kilnSlot !== candidate.kilnSlot) continue
-    const otherWindow = annealWindow(row, wallThicknessOf(row.pieceId))
-    if (windowsOverlap(ownWindow, otherWindow)) {
-      return {
-        conflict: true,
-        withPieceId: row.pieceId,
-        withAnnealId: row.id,
-        message: `窑位 ${candidate.kilnSlot} 在该时间窗内已被占用（${row.inAt} 起的 ${row.curveSeg} 段），请更换窑位或调整时间。`,
-      }
-    }
-  }
-  return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
+/** 两个入窑时间是否对得上（差值不超过容差） */
+export function timesAlign(aAt: string, bAt: string, toleranceMs = ALIGN_TOLERANCE_MS): boolean {
+  const a = parseAt(aAt)
+  const b = parseAt(bAt)
+  if (Number.isNaN(a) || Number.isNaN(b)) return false
+  return Math.abs(a - b) <= toleranceMs
+}
+
+/** 按入窑时间 + 壁厚理论曲线时长，求计划出炉时间（YYYY-MM-DDTHH:mm） */
+export function plannedOutAt(inAt: string, wallThicknessMm: number): string {
+  const start = parseAt(inAt)
+  if (Number.isNaN(start)) return ''
+  return toLocalInput(new Date(start + totalAnnealHours(wallThicknessMm) * 3600 * 1000))
+}
+
+/** Date → datetime-local 字符串（YYYY-MM-DDTHH:mm） */
+export function toLocalInput(date: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}`
+}
+
+/** 炉次时间窗：优先实际入出炉，未出炉时回退计划时间 */
+export function runWindow(run: {
+  plannedInAt: string
+  plannedOutAt: string
+  actualInAt: string
+  actualOutAt: string
+}): [number, number] {
+  const start = parseAt(run.actualInAt !== '' ? run.actualInAt : run.plannedInAt)
+  const planEnd = parseAt(run.plannedOutAt)
+  const end = run.actualOutAt !== '' ? parseAt(run.actualOutAt) : planEnd
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return [Number.NaN, Number.NaN]
+  return [start, end]
 }
 
 /** 生成某台退火窑的窑位列表 */

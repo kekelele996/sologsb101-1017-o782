@@ -28,6 +28,11 @@ export interface Furnace {
   fuelType: FuelType
   /** 运行状态 */
   state: FurnaceState
+  /**
+   * 装载容量（件数封顶）：一炉最多并烧几件。
+   * 仅退火窑参与排产封顶；旧数据没有该字段，升级到 v3 时补默认值 DEFAULT_KILN_CAPACITY。
+   */
+  capacity: number
   createdAt: string
   updatedAt: string
   revision: number
@@ -40,4 +45,5 @@ export interface FurnaceDraft {
   maxTempC: number
   fuelType: FuelType
   state: FurnaceState
+  capacity: number
 }

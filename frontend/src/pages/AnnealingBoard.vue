@@ -1,8 +1,10 @@
 <script setup lang="ts">
 /**
- * /annealing 退火窑位分配与曲线编排
- * 窑位冲突时禁用提交；出炉即回写作品状态为「已退火」。
- * 消费模型：Anneal、Piece、Furnace；复用组件：<FilterBar>、<StatBadge>、<StageTag>、<EmptyPanel>
+ * /annealing 退火窑炉次编排
+ * 窑务排产员按炉次编排：曲线相同、入窑时间对得上的待入窑作品并成一炉、共用一组窑位，
+ * 装载容量按件数封顶，排不下 / 撞炉窗口的留在队列等下一炉，不挤已入窑的炉。
+ * 退火值守按炉次记实际入窑与出炉；烧完件数对不上时在炉次上写清，计划 / 实际两边各留一份。
+ * 消费模型：Anneal、KilnRun、Piece、Furnace；复用组件：<FilterBar>、<StatBadge>、<StageTag>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -13,13 +15,22 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg } from '@/types/anneal'
-import { ANNEAL_CURVE, formatHours, segmentHours, totalAnnealHours } from '@/utils/thermal'
+import {
+  CURVE_SEG_OPTIONS,
+  type Anneal,
+  type AnnealDraft,
+  type AnnealState,
+  type CurveSeg,
+} from '@/types/anneal'
+import type { KilnRun } from '@/types/run'
+import { ANNEAL_CURVE, formatHours, plannedOutAt, segmentHours, totalAnnealHours } from '@/utils/thermal'
 import { nowLocalInput } from '@/utils/id'
 
 const annealStore = useAnnealStore()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+
+/* ------------------------------ 排队 / 编辑弹窗 ------------------------------ */
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -28,53 +39,27 @@ const formRef = ref<FormInstance>()
 
 const form = reactive<AnnealDraft>({
   pieceId: '',
-  kilnSlot: '',
-  curveSeg: '缓冷' as CurveSeg,
-  inAt: nowLocalInput(),
-  outAt: '',
-  state: '待入窑',
+  kilnCode: '',
+  expectedInAt: nowLocalInput(),
+  curveSeg: '保温' as CurveSeg,
 })
 
 const rules: FormRules<AnnealDraft> = {
   pieceId: [{ required: true, message: '请选择作品', trigger: 'change' }],
-  kilnSlot: [{ required: true, message: '请选择窑位', trigger: 'change' }],
+  kilnCode: [{ required: true, message: '请选择目标退火窑', trigger: 'change' }],
+  expectedInAt: [{ required: true, message: '请选择期望入窑时间', trigger: 'change' }],
   curveSeg: [{ required: true, message: '请选择曲线段', trigger: 'change' }],
-  inAt: [{ required: true, message: '请选择入窑时间', trigger: 'change' }],
-  state: [{ required: true, message: '请选择退火状态', trigger: 'change' }],
 }
 
-const pieceName = computed<Record<string, string>>(() =>
-  Object.fromEntries(pieceStore.pieces.map((row) => [row.id, `${row.name} · ${row.craft}`]))
+/** 还能排队的作品：没有未完成退火记录 */
+const queueablePieces = computed(() =>
+  pieceStore.pieces.filter((piece) => annealStore.activeAnnealOfPiece(piece.id, editingId.value ?? '') === undefined),
 )
 
-const slotOptions = computed<string[]>(() => {
-  const codes = furnaceStore.annealingFurnaces.map((row) => row.code)
-  if (codes.length === 0) return annealStore.allSlots
-  const list: string[] = []
-  codes.forEach((code) => {
-    for (let index = 0; index < 9; index += 1) {
-      const row = String.fromCharCode(65 + Math.floor(index / 3))
-      list.push(`${code}-${row}${(index % 3) + 1}`)
-    }
-  })
-  return list
-})
-
-/** 当前表单的窑位冲突检测结果，冲突时禁用提交 */
-const conflict = computed(() =>
-  annealStore.conflictOf({
-    id: editingId.value ?? '',
-    kilnSlot: form.kilnSlot,
-    inAt: form.inAt,
-    outAt: form.outAt,
-    curveSeg: form.curveSeg,
-    pieceId: form.pieceId,
-  })
-)
+const selectedPiece = computed(() => pieceStore.pieces.find((row) => row.id === form.pieceId) ?? null)
 
 const formDuration = computed(() => {
-  const piece = pieceStore.pieces.find((row) => row.id === form.pieceId)
-  const thickness = piece?.wallThicknessMm ?? 4
+  const thickness = selectedPiece.value?.wallThicknessMm ?? 4
   return {
     segment: formatHours(segmentHours(form.curveSeg, thickness)),
     total: formatHours(totalAnnealHours(thickness)),
@@ -82,12 +67,63 @@ const formDuration = computed(() => {
   }
 })
 
+/** 排队后能不能并炉的预判（仅提示，不改变提交） */
+const mergePreview = computed(() => {
+  if (form.pieceId === '' || form.kilnCode === '' || form.expectedInAt === '') return null
+  return annealStore.previewQueue(form.pieceId, form.kilnCode, form.expectedInAt)
+})
+
+/* ------------------------------ 值守（入炉 / 出炉）弹窗 ------------------------------ */
+
+const dutyDialogVisible = ref(false)
+const dutyMode = ref<'checkin' | 'close'>('checkin')
+const dutyRun = ref<KilnRun | null>(null)
+const dutyAt = ref(nowLocalInput())
+const dutyPieceIds = ref<string[]>([])
+const dutyNote = ref('')
+
+/* ------------------------------ 统计与筛选 ------------------------------ */
+
 const stats = computed(() => ({
-  total: annealStore.anneals.length,
-  waiting: annealStore.anneals.filter((row) => row.state === '待入窑').length,
-  firing: annealStore.anneals.filter((row) => row.state === '退火中').length,
-  done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
+  queue: annealStore.queuedAnneals.length,
+  waitingRun: annealStore.runStateCounts['待入窑'],
+  firing: annealStore.runStateCounts['退火中'],
+  done: annealStore.runStateCounts['已出炉'],
+  plannedPieces: annealStore.runs
+    .filter((run) => run.state === '待入窑')
+    .reduce((acc, run) => acc + run.planPieceIds.length, 0),
 }))
+
+const stateFilter = ref<AnnealState | 'all'>('all')
+const kilnFilter = ref<string>('all')
+const keyword = ref('')
+
+const visibleRunRows = computed(() => {
+  const key = keyword.value.trim().toLowerCase()
+  return annealStore.runRows.filter(({ run, members }) => {
+    if (stateFilter.value !== 'all' && run.state !== stateFilter.value) return false
+    if (kilnFilter.value !== 'all' && run.kilnCode !== kilnFilter.value) return false
+    if (key === '') return true
+    const names = run.planPieceIds.map((id) => annealStore.pieceName(id)).join(' ').toLowerCase()
+    return (
+      run.kilnCode.toLowerCase().includes(key) ||
+      names.includes(key) ||
+      members.some((row) => row.kilnSlot.toLowerCase().includes(key))
+    )
+  })
+})
+
+const visibleQueue = computed(() => {
+  const key = keyword.value.trim().toLowerCase()
+  return annealStore.queuedAnneals.filter((row) => {
+    if (kilnFilter.value !== 'all' && row.kilnCode !== kilnFilter.value) return false
+    if (key === '') return true
+    return (
+      annealStore.pieceName(row.pieceId).toLowerCase().includes(key) ||
+      row.kilnCode.toLowerCase().includes(key)
+    )
+  })
+})
 
 onMounted(() => {
   void annealStore.loadAll()
@@ -95,15 +131,16 @@ onMounted(() => {
   void furnaceStore.loadAll()
 })
 
+/* ------------------------------ 排队动作 ------------------------------ */
+
 function openCreate(): void {
   editingId.value = null
+  const firstPiece = queueablePieces.value[0]
   Object.assign(form, {
-    pieceId: pieceStore.currentPieceId ?? pieceStore.pieces[0]?.id ?? '',
-    kilnSlot: slotOptions.value[0] ?? 'AN-01-A1',
-    curveSeg: '缓冷' as CurveSeg,
-    inAt: nowLocalInput(),
-    outAt: '',
-    state: '待入窑' as AnnealState,
+    pieceId: firstPiece?.id ?? pieceStore.currentPieceId ?? '',
+    kilnCode: annealStore.kilnCodes[0] ?? 'AN-01',
+    expectedInAt: nowLocalInput(),
+    curveSeg: '保温' as CurveSeg,
   })
   dialogVisible.value = true
 }
@@ -112,11 +149,9 @@ function openEdit(row: Anneal): void {
   editingId.value = row.id
   Object.assign(form, {
     pieceId: row.pieceId,
-    kilnSlot: row.kilnSlot,
+    kilnCode: row.kilnCode,
+    expectedInAt: row.expectedInAt,
     curveSeg: row.curveSeg,
-    inAt: row.inAt,
-    outAt: row.outAt,
-    state: row.state,
   })
   dialogVisible.value = true
 }
@@ -125,26 +160,22 @@ async function handleSubmit(): Promise<void> {
   if (formRef.value === undefined) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
-  if (conflict.value.conflict) {
-    ElMessage.error(conflict.value.message)
-    return
-  }
   submitting.value = true
   try {
     if (editingId.value === null) {
-      const row = await annealStore.createAnneal({ ...form })
+      const row = await annealStore.enqueue({ ...form })
       if (row === null) {
         ElMessage.error(annealStore.lastMessage)
         return
       }
-      ElMessage.success(`已分配窑位 ${row.kilnSlot}`)
+      ElMessage.success(annealStore.lastMessage)
     } else {
-      const ok = await annealStore.updateAnneal(editingId.value, { ...form })
+      const ok = await annealStore.updateQueue(editingId.value, { ...form })
       if (!ok) {
         ElMessage.error(annealStore.lastMessage)
         return
       }
-      ElMessage.success('退火编排已更新')
+      ElMessage.success(annealStore.lastMessage)
     }
     dialogVisible.value = false
   } finally {
@@ -154,7 +185,7 @@ async function handleSubmit(): Promise<void> {
 
 async function handleDelete(row: Anneal): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认删除窑位 ${row.kilnSlot} 的退火记录？`, '删除确认', {
+    await ElMessageBox.confirm(`确认删除「${annealStore.pieceName(row.pieceId)}」的退火排队记录？`, '删除确认', {
       type: 'warning',
       confirmButtonText: '删除',
       cancelButtonText: '取消',
@@ -166,36 +197,96 @@ async function handleDelete(row: Anneal): Promise<void> {
   ElMessage.success('退火记录已删除')
 }
 
-async function handleAdvance(row: Anneal): Promise<void> {
-  const next = await annealStore.advance(row.id)
-  if (next === null) {
-    ElMessage.info('该记录已处于「已出炉」状态')
+async function handleSchedule(): Promise<void> {
+  if (annealStore.queuedAnneals.length === 0) {
+    ElMessage.info('待入窑队列为空')
     return
   }
+  try {
+    await ElMessageBox.confirm(
+      '将把曲线相同（壁厚一致）、入窑时间对得上的待入窑作品并成一炉，共用一组窑位；超过退火窑容量或撞上在烧炉窗口的件会留在队列等下一炉。',
+      '按炉次自动排产',
+      { type: 'info', confirmButtonText: '开始排产', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  const result = await annealStore.schedule()
+  ElMessage.success(`已编排 ${result.created} 炉${result.blocked > 0 ? `，${result.blocked} 件留队列等下一炉` : ''}`)
+}
+
+/* ------------------------------ 炉次值守 ------------------------------ */
+
+function openCheckin(run: KilnRun): void {
+  dutyMode.value = 'checkin'
+  dutyRun.value = run
+  dutyAt.value = run.plannedInAt || nowLocalInput()
+  dutyPieceIds.value = [...run.planPieceIds]
+  dutyNote.value = run.dutyNote
+  dutyDialogVisible.value = true
+}
+
+function openClose(run: KilnRun): void {
+  dutyMode.value = 'close'
+  dutyRun.value = run
+  dutyAt.value = run.plannedOutAt || nowLocalInput()
+  dutyPieceIds.value = [...run.actualPieceIds]
+  dutyNote.value = run.dutyNote
+  dutyDialogVisible.value = true
+}
+
+async function handleDutySubmit(): Promise<void> {
+  const run = dutyRun.value
+  if (run === null) return
+  if (dutyPieceIds.value.length === 0) {
+    ElMessage.warning('实际件数不能为 0 件；如整炉未烧，请先在炉次说明里注明并退回队列。')
+    return
+  }
+  if (dutyMode.value === 'checkin') {
+    const result = await annealStore.checkin(run.id, dutyAt.value, dutyPieceIds.value, dutyNote.value)
+    if (result === null) {
+      ElMessage.error(annealStore.lastMessage)
+      return
+    }
+  } else {
+    if (dutyPieceIds.value.length !== run.actualPieceIds.length && dutyNote.value.trim() === '') {
+      ElMessage.warning('出炉件数与入炉件数对不上，请在炉次说明里写清原因后再提交。')
+      return
+    }
+    const result = await annealStore.close(run.id, dutyAt.value, dutyPieceIds.value, dutyNote.value)
+    if (result === null) {
+      ElMessage.error(annealStore.lastMessage)
+      return
+    }
+  }
   ElMessage.success(annealStore.lastMessage)
+  dutyDialogVisible.value = false
 }
 
 function handleFilterChange(key: string, value: string): void {
-  if (key === 'state') annealStore.setFilters({ state: value as AnnealState | 'all' })
-  if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
-  if (key === 'kilnCode') annealStore.setFilters({ kilnCode: value })
+  if (key === 'state') stateFilter.value = value as AnnealState | 'all'
+  if (key === 'kilnCode') kilnFilter.value = value
+}
+
+function dutyPieceOptions(run: KilnRun): string[] {
+  return dutyMode.value === 'checkin' ? run.planPieceIds : run.actualPieceIds
 }
 </script>
 
 <template>
   <div>
     <div class="stat-row">
-      <StatBadge label="退火记录" :value="stats.total" suffix="条" tone="primary" icon="Histogram" />
-      <StatBadge label="待入窑" :value="stats.waiting" suffix="条" tone="info" icon="DataLine" />
-      <StatBadge label="退火中" :value="stats.firing" suffix="条" tone="warning" icon="TrendCharts" />
-      <StatBadge label="已出炉" :value="stats.done" suffix="条" tone="success" icon="PieChart" />
+      <StatBadge label="待入窑队列" :value="stats.queue" suffix="件" tone="info" icon="DataLine" />
+      <StatBadge label="待开炉" :value="stats.waitingRun" suffix="炉" tone="primary" icon="Histogram" />
+      <StatBadge label="退火中" :value="stats.firing" suffix="炉" tone="warning" icon="TrendCharts" />
+      <StatBadge label="已出炉" :value="stats.done" suffix="炉" tone="success" icon="PieChart" />
       <StatBadge
         label="窑位占用率"
         :value="`${annealStore.occupancyRate}%`"
         :percent="annealStore.occupancyRate"
         tone="primary"
         icon="PieChart"
-        :hint="`已占用 ${annealStore.occupiedSlotCount} / ${annealStore.allSlots.length} 个窑位`"
+        :hint="`未出炉炉次占用 ${annealStore.occupiedSlots.size} / ${annealStore.allSlots.length} 个窑位`"
       />
     </div>
 
@@ -208,49 +299,38 @@ function handleFilterChange(key: string, value: string): void {
       :title="annealStore.lastMessage"
     />
 
+    <!-- ============================ 待入窑队列 ============================ -->
     <el-card shadow="never">
       <template #header>
         <div class="card-header">
-          <span class="card-header__title">退火窑位分配与曲线编排</span>
-          <el-button type="primary" @click="openCreate" :disabled="pieceStore.pieces.length === 0 || slotOptions.length === 0">
-            <el-icon><Plus /></el-icon>
-            <span>分配窑位</span>
-          </el-button>
+          <span class="card-header__title">待入窑队列（每件先进队，等排产并炉）</span>
+          <el-space wrap>
+            <el-button type="primary" plain @click="handleSchedule" :disabled="annealStore.queuedAnneals.length === 0">
+              <el-icon><Operation /></el-icon>
+              <span>按炉次排产</span>
+            </el-button>
+            <el-button type="primary" @click="openCreate" :disabled="annealStore.kilnCodes.length === 0">
+              <el-icon><Plus /></el-icon>
+              <span>作品入队</span>
+            </el-button>
+          </el-space>
         </div>
       </template>
 
-      <FilterBar
-        :keyword="annealStore.filters.keyword"
-        :fields="[
-          { key: 'state', label: '退火状态', options: ANNEAL_STATE_OPTIONS as unknown as string[] },
-          { key: 'curveSeg', label: '曲线段', options: CURVE_SEG_OPTIONS as unknown as string[] },
-          { key: 'kilnCode', label: '退火窑', options: annealStore.kilnCodes },
-        ]"
-        :values="{
-          state: annealStore.filters.state,
-          curveSeg: annealStore.filters.curveSeg,
-          kilnCode: annealStore.filters.kilnCode,
-        }"
-        :result-text="`命中 ${annealStore.visibleAnneals.length} / ${annealStore.anneals.length} 条`"
-        @update:keyword="(value: string) => annealStore.setFilters({ keyword: value })"
-        @change="handleFilterChange"
-        @reset="annealStore.resetFilters()"
-      />
-
       <EmptyPanel
-        v-if="annealStore.ready && annealStore.anneals.length === 0"
-        title="还没有退火编排"
-        description="为已完成全部工序的作品分配退火窑位与曲线段；同一窑位在时间窗重叠时会禁止提交。"
-        action-text="分配第一个窑位"
+        v-if="annealStore.ready && annealStore.queuedAnneals.length === 0"
+        title="待入窑队列已空"
+        description="完成全部吹制工序的作品先在此排队（只选目标退火窑与期望入窑时间）；排产时曲线相同、时间对得上的会并成一炉，共用一组窑位。"
+        action-text="把作品加入队列"
         @action="openCreate"
       />
 
-      <el-table v-else v-loading="!annealStore.ready" :data="annealStore.visibleAnneals" row-key="id" stripe>
+      <el-table v-else v-loading="!annealStore.ready" :data="visibleQueue" row-key="id" stripe>
         <el-table-column label="作品" min-width="190">
           <template #default="{ row }">
             <div class="cell-stack">
               <el-link type="primary" @click="$router.push(`/pieces/${row.pieceId}/steps`)">
-                {{ pieceName[row.pieceId] ?? '（作品已删除）' }}
+                {{ annealStore.pieceName(row.pieceId) }}
               </el-link>
               <span class="cell-sub">
                 壁厚 {{ annealStore.wallThicknessOf(row.pieceId) }} mm · 全流程
@@ -259,52 +339,29 @@ function handleFilterChange(key: string, value: string): void {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="阶段" width="150">
+        <el-table-column label="阶段" width="140">
           <template #default="{ row }">
             <StageTag :stage="pieceStore.pieces.find((item) => item.id === row.pieceId)?.state ?? null" size="small" />
           </template>
         </el-table-column>
-        <el-table-column prop="kilnSlot" label="窑位" width="130" />
-        <el-table-column label="曲线段" width="120">
+        <el-table-column prop="kilnCode" label="目标退火窑" width="120" />
+        <el-table-column label="曲线段" width="100">
           <template #default="{ row }">
-            <el-tag
-              size="small"
-              :type="row.curveSeg === '升温' ? 'warning' : row.curveSeg === '保温' ? 'primary' : 'success'"
-            >
+            <el-tag size="small" :type="row.curveSeg === '升温' ? 'warning' : row.curveSeg === '保温' ? 'primary' : 'success'">
               {{ row.curveSeg }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="该段时长" width="120" align="right">
+        <el-table-column label="期望入窑 / 预计出炉" min-width="280">
           <template #default="{ row }">
-            {{ formatHours(segmentHours(row.curveSeg, annealStore.wallThicknessOf(row.pieceId))) }}
+            <div class="cell-stack">
+              <span>{{ row.expectedInAt.replace('T', ' ') }}</span>
+              <span class="cell-sub">预计 {{ plannedOutAt(row.expectedInAt, annealStore.wallThicknessOf(row.pieceId)).replace('T', ' ') }}</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="入窑时间" width="160">
-          <template #default="{ row }">{{ row.inAt.replace('T', ' ') }}</template>
-        </el-table-column>
-        <el-table-column label="出炉时间" width="160">
+        <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
-            <span v-if="row.outAt === ''" class="cell-sub">未出炉</span>
-            <span v-else>{{ row.outAt.replace('T', ' ') }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="110">
-          <template #default="{ row }">
-            <el-tag
-              size="small"
-              :type="row.state === '已出炉' ? 'success' : row.state === '退火中' ? 'warning' : 'info'"
-              effect="dark"
-            >
-              {{ row.state }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
-          <template #default="{ row }">
-            <el-button link type="primary" size="small" :disabled="row.state === '已出炉'" @click="handleAdvance(row)">
-              推进状态
-            </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
           </template>
@@ -312,38 +369,138 @@ function handleFilterChange(key: string, value: string): void {
       </el-table>
     </el-card>
 
+    <!-- ============================ 炉次 ============================ -->
     <el-card shadow="never" class="mt-14">
       <template #header>
-        <span class="card-header__title">窑位占用表</span>
+        <div class="card-header">
+          <span class="card-header__title">退火炉次（一炉多件并烧，共用一组窑位）</span>
+        </div>
+      </template>
+
+      <FilterBar
+        :keyword="keyword"
+        :fields="[
+          { key: 'state', label: '炉次状态', options: ['待入窑', '退火中', '已出炉'] },
+          { key: 'kilnCode', label: '退火窑', options: annealStore.kilnCodes },
+        ]"
+        :values="{ state: stateFilter, kilnCode: kilnFilter }"
+        :result-text="`命中 ${visibleRunRows.length} / ${annealStore.runs.length} 炉；队列 ${visibleQueue.length} 件`"
+        @update:keyword="(value: string) => (keyword = value)"
+        @change="handleFilterChange"
+        @reset="
+          () => {
+            stateFilter = 'all'
+            kilnFilter = 'all'
+            keyword = ''
+          }
+        "
+      />
+
+      <EmptyPanel
+        v-if="annealStore.ready && annealStore.runs.length === 0"
+        title="还没有炉次"
+        description="把待入窑作品排产后会在此生成炉次卡片；同一炉的作品曲线相同、共用窑位，退火值守按炉次记实际入出炉。"
+        :action-text="annealStore.queuedAnneals.length > 0 ? '立即按炉次排产' : ''"
+        @action="handleSchedule"
+      />
+
+      <div v-else class="run-grid">
+        <div v-for="{ run, members, capacity } in visibleRunRows" :key="run.id" class="run-card" :class="`is-${run.state}`">
+          <div class="run-card__head">
+            <div class="cell-stack">
+              <b>{{ run.kilnCode }} · 第 {{ run.seq }} 炉</b>
+              <span class="cell-sub">壁厚 {{ run.wallThicknessMm }} mm · 曲线 {{ run.curveKey }}</span>
+            </div>
+            <el-tag size="small" :type="run.state === '已出炉' ? 'success' : run.state === '退火中' ? 'warning' : 'info'" effect="dark">
+              {{ run.state }}
+            </el-tag>
+          </div>
+
+          <div class="run-meta">
+            <span>装载 {{ run.planPieceIds.length }} / {{ capacity }} 件</span>
+            <span>窑位 {{ run.slots.length > 0 ? run.slots.join('、') : '待分配' }}</span>
+          </div>
+          <div class="run-meta">
+            <span>计划 {{ run.plannedInAt.replace('T', ' ') }} → {{ run.plannedOutAt.replace('T', ' ') }}</span>
+          </div>
+          <div class="run-meta" v-if="run.actualInAt !== '' || run.actualOutAt !== ''">
+            <span class="actual">
+              实际 {{ (run.actualInAt || '—').replace('T', ' ') }} → {{ run.actualOutAt === '' ? '在烧' : run.actualOutAt.replace('T', ' ') }}
+              （{{ run.actualPieceIds.length }} 件）
+            </span>
+          </div>
+
+          <ul class="run-pieces">
+            <li v-for="anneal in members" :key="anneal.id">
+              <el-link type="primary" @click="$router.push(`/pieces/${anneal.pieceId}/steps`)">
+                {{ annealStore.pieceName(anneal.pieceId) }}
+              </el-link>
+              <span class="cell-sub">{{ anneal.kilnSlot || '窑位待分配' }} · {{ anneal.curveSeg }}</span>
+            </li>
+            <li v-if="members.length === 0" class="cell-sub">（该炉下已无退火记录，可能已被删除）</li>
+          </ul>
+
+          <el-alert
+            v-if="run.dutyNote !== ''"
+            type="warning"
+            :closable="false"
+            class="run-note"
+            title="值守说明"
+            :description="run.dutyNote"
+          />
+          <el-alert
+            v-else-if="run.state === '已出炉' && run.actualPieceIds.length !== run.planPieceIds.length"
+            type="error"
+            :closable="false"
+            class="run-note"
+            :title="`件数不符：计划 ${run.planPieceIds.length} 件，实际出炉 ${run.actualPieceIds.length} 件，需在炉次上补说明`"
+          />
+
+          <div class="run-actions">
+            <el-button v-if="run.state === '待入窑'" size="small" type="primary" @click="openCheckin(run)">
+              登记实际入窑
+            </el-button>
+            <el-button v-if="run.state === '退火中'" size="small" type="primary" @click="openClose(run)">
+              登记出炉
+            </el-button>
+            <span v-if="run.state === '已出炉'" class="cell-sub">已完成归档</span>
+          </div>
+        </div>
+      </div>
+    </el-card>
+
+    <!-- ============================ 窑位占用表 ============================ -->
+    <el-card shadow="never" class="mt-14">
+      <template #header>
+        <span class="card-header__title">窑位占用表（未出炉炉次占格）</span>
       </template>
       <div class="slot-grid">
         <div
           v-for="slot in annealStore.allSlots"
           :key="slot"
           class="slot-cell"
-          :class="{ 'is-occupied': annealStore.occupancy.some((row) => row.kilnSlot === slot && row.occupied) }"
+          :class="{ 'is-occupied': annealStore.occupiedSlots.has(slot) }"
         >
           <div class="slot-name">{{ slot }}</div>
-          <template v-for="row in annealStore.occupancy.filter((item) => item.kilnSlot === slot)" :key="row.annealId">
+          <template v-for="row in annealStore.runRows.filter((item) => item.run.slots.includes(slot) && item.run.state !== '已出炉')" :key="row.run.id">
             <div class="slot-detail">
-              {{ row.pieceName }} · {{ row.curveSeg }} · {{ row.state }}
+              {{ row.run.kilnCode }} 第{{ row.run.seq }}炉 · {{ row.run.state }} · {{ row.run.planPieceIds.length }}件
             </div>
           </template>
-          <div v-if="annealStore.occupancy.filter((item) => item.kilnSlot === slot).length === 0" class="slot-detail is-free">
-            空闲
-          </div>
+          <div v-if="!annealStore.occupiedSlots.has(slot)" class="slot-detail is-free">空闲</div>
         </div>
       </div>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingId === null ? '分配退火窑位' : '编辑退火编排'" width="660px">
+    <!-- ============================ 入队 / 编辑弹窗 ============================ -->
+    <el-dialog v-model="dialogVisible" :title="editingId === null ? '作品加入待入窑队列' : '编辑排队意向'" width="660px">
       <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="作品" prop="pieceId">
-              <el-select v-model="form.pieceId" filterable style="width: 100%">
+              <el-select v-model="form.pieceId" filterable style="width: 100%" :disabled="editingId !== null">
                 <el-option
-                  v-for="item in pieceStore.pieces"
+                  v-for="item in queueablePieces"
                   :key="item.id"
                   :value="item.id"
                   :label="`${item.name} · ${item.craft} · 壁厚 ${item.wallThicknessMm} mm`"
@@ -352,9 +509,14 @@ function handleFilterChange(key: string, value: string): void {
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="退火窑位" prop="kilnSlot">
-              <el-select v-model="form.kilnSlot" filterable style="width: 100%">
-                <el-option v-for="slot in slotOptions" :key="slot" :value="slot" :label="slot" />
+            <el-form-item label="目标退火窑" prop="kilnCode">
+              <el-select v-model="form.kilnCode" filterable style="width: 100%">
+                <el-option
+                  v-for="item in annealStore.annealingFurnaces"
+                  :key="item.id"
+                  :value="item.code"
+                  :label="`${item.code} · 容量 ${item.capacity || 9} 件/炉`"
+                />
               </el-select>
             </el-form-item>
           </el-col>
@@ -367,58 +529,106 @@ function handleFilterChange(key: string, value: string): void {
               </el-select>
             </el-form-item>
           </el-col>
-          <el-col :span="8">
-            <el-form-item label="入窑时间" prop="inAt">
+          <el-col :span="16">
+            <el-form-item label="期望入窑时间" prop="expectedInAt">
               <el-date-picker
-                v-model="form.inAt"
+                v-model="form.expectedInAt"
                 type="datetime"
                 value-format="YYYY-MM-DDTHH:mm"
                 format="YYYY-MM-DD HH:mm"
-                style="width: 100%"
-              />
-            </el-form-item>
-          </el-col>
-          <el-col :span="8">
-            <el-form-item label="出炉时间">
-              <el-date-picker
-                v-model="form.outAt"
-                type="datetime"
-                value-format="YYYY-MM-DDTHH:mm"
-                format="YYYY-MM-DD HH:mm"
-                placeholder="未出炉可留空"
                 style="width: 100%"
               />
             </el-form-item>
           </el-col>
         </el-row>
-        <el-form-item label="退火状态" prop="state">
-          <el-select v-model="form.state" style="width: 100%">
-            <el-option v-for="item in ANNEAL_STATE_OPTIONS" :key="item" :value="item" :label="item" />
-          </el-select>
-        </el-form-item>
 
         <el-alert
-          v-if="conflict.conflict"
-          type="error"
-          show-icon
-          :closable="false"
-          title="窑位冲突，无法提交"
-          :description="conflict.message"
-        />
-        <el-alert
-          v-else
+          v-if="mergePreview !== null && mergePreview.matchRuns.some((run) => run.planPieceIds.length < annealStore.capacityOfCode(run.kilnCode))"
           type="success"
           show-icon
           :closable="false"
-          title="窑位可用，可以提交"
-          :description="`当前曲线段「${form.curveSeg}」理论时长 ${formDuration.segment}，该作品全流程退火 ${formDuration.total}。${formDuration.hint}`"
+          title="时间与曲线对得上：排产时可并入同曲线待开炉，共用一组窑位"
+          :description="`全流程退火 ${formDuration.total}，预计 ${mergePreview?.plannedOutAt.replace('T', ' ')} 出炉。`"
+        />
+        <el-alert
+          v-else
+          type="info"
+          show-icon
+          :closable="false"
+          title="排队后由排产员按炉次编排"
+          :description="`当前曲线段「${form.curveSeg}」该段时长 ${formDuration.segment}，作品全流程 ${formDuration.total}；同壁厚且入窑时间相差不超过 1 小时的作品才会并炉。${formDuration.hint}`"
         />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" :disabled="conflict.conflict" @click="handleSubmit">
-          保存
-        </el-button>
+        <el-button type="primary" :loading="submitting" @click="handleSubmit">入队</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ============================ 值守弹窗 ============================ -->
+    <el-dialog
+      v-model="dutyDialogVisible"
+      :title="dutyRun === null ? '' : `${dutyRun.kilnCode} 第 ${dutyRun.seq} 炉 · ${dutyMode === 'checkin' ? '登记实际入窑' : '登记出炉'}`"
+      width="620px"
+    >
+      <div v-if="dutyRun !== null" class="duty-body">
+        <el-descriptions :column="1" border size="small">
+          <el-descriptions-item label="计划（排产员留存）">
+            {{ dutyRun.plannedInAt.replace('T', ' ') }} → {{ dutyRun.plannedOutAt.replace('T', ' ') }}
+            ，共 {{ dutyRun.planPieceIds.length }} 件：
+            {{ dutyRun.planPieceIds.map((id) => annealStore.pieceName(id)).join('、') }}
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <el-form label-width="110px" class="mt-14">
+          <el-form-item :label="dutyMode === 'checkin' ? '实际入窑时间' : '实际出炉时间'">
+            <el-date-picker
+              v-model="dutyAt"
+              type="datetime"
+              value-format="YYYY-MM-DDTHH:mm"
+              format="YYYY-MM-DD HH:mm"
+              style="width: 100%"
+            />
+          </el-form-item>
+          <el-form-item :label="dutyMode === 'checkin' ? '实际随炉件' : '实际出炉件'">
+            <el-select v-model="dutyPieceIds" multiple filterable style="width: 100%" placeholder="勾选实际随炉 / 出炉的件">
+              <el-option
+                v-for="pieceId in dutyPieceOptions(dutyRun)"
+                :key="pieceId"
+                :value="pieceId"
+                :label="annealStore.pieceName(pieceId)"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="值守说明">
+            <el-input
+              v-model="dutyNote"
+              type="textarea"
+              :rows="3"
+              :placeholder="
+                dutyMode === 'checkin'
+                  ? '计划件没到场时，未勾选的件会自动退回待入窑重排；件数对不上请在此写清原因。'
+                  : '出炉件数与入炉件数对不上时必须写清原因，计划 / 实际两边各留一份。'
+              "
+            />
+          </el-form-item>
+        </el-form>
+
+        <el-alert
+          v-if="dutyPieceIds.length !== dutyPieceOptions(dutyRun).length"
+          type="warning"
+          show-icon
+          :closable="false"
+          :title="
+            dutyMode === 'checkin'
+              ? `计划 ${dutyPieceOptions(dutyRun).length} 件，实际勾选 ${dutyPieceIds.length} 件；未勾选件将退回队列重排`
+              : `入炉 ${dutyPieceOptions(dutyRun).length} 件，实际出炉勾选 ${dutyPieceIds.length} 件，请在说明里写清`
+          "
+        />
+      </div>
+      <template #footer>
+        <el-button @click="dutyDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="handleDutySubmit">{{ dutyMode === 'checkin' ? '确认入窑' : '确认出炉' }}</el-button>
       </template>
     </el-dialog>
   </div>
@@ -457,6 +667,75 @@ function handleFilterChange(key: string, value: string): void {
   color: #8b95a1;
 }
 
+.run-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.run-card {
+  border: 1px solid #e4e7ed;
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: #fafcff;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-card.is-退火中 {
+  border-color: #f0b27a;
+  background: #fff8f1;
+}
+
+.run-card.is-已出炉 {
+  border-color: #b7e4c7;
+  background: #f4fcf6;
+}
+
+.run-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 12px;
+  color: #5b6b7a;
+}
+
+.run-meta .actual {
+  color: #b25b00;
+}
+
+.run-pieces {
+  list-style: none;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px dashed #dfe5ec;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.run-note {
+  margin: 0;
+}
+
+.run-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
 .slot-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -490,6 +769,11 @@ function handleFilterChange(key: string, value: string): void {
 
 .slot-detail.is-free {
   color: #a8b0b8;
+}
+
+.duty-body {
+  display: flex;
+  flex-direction: column;
 }
 
 .mt-14 {
