@@ -1,7 +1,7 @@
 /**
  * 热工计算工具
  * - 退火曲线段时长换算（升温 / 保温 / 缓冷）
- * - 窑位占用判重（同一窑位时间窗重叠检测）
+ * - 炉次组炉：曲线匹配 / 时间对齐 / 装载容量封顶 / 窑位组分配与冲突判重
  * - 温度单位换算（℃ ↔ ℉）
  * - 工艺温度区间与设计尺寸校验
  */
@@ -107,59 +107,166 @@ export function parseAt(value: string): number {
   return Number.isNaN(stamp) ? Number.NaN : stamp
 }
 
-/** 时间窗：[入窑, 出炉]；未出炉时以入窑 + 预计时长作为临时出炉时间 */
-export function annealWindow(row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg'>, wallThicknessMm: number): [number, number] {
-  const start = parseAt(row.inAt)
-  if (Number.isNaN(start)) return [Number.NaN, Number.NaN]
-  const end = parseAt(row.outAt)
-  if (!Number.isNaN(end) && end > start) return [start, end]
-  return [start, start + segmentHours(row.curveSeg, wallThicknessMm) * 3600 * 1000]
+/** 时间戳转 datetime-local 字符串（YYYY-MM-DDTHH:mm），秒 / 毫秒向下取整到分钟 */
+export function toLocalInput(date: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}`
 }
 
-/** 两个时间窗是否重叠 */
+/** 两个时间窗是否重叠（端点相接不算重叠：前一炉出炉即可装入下一炉） */
 export function windowsOverlap(a: [number, number], b: [number, number]): boolean {
   if (Number.isNaN(a[0]) || Number.isNaN(b[0])) return false
   return a[0] < b[1] && b[0] < a[1]
 }
 
-export interface SlotConflict {
-  conflict: boolean
-  /** 冲突的既有退火记录 */
-  withPieceId: string
-  withAnnealId: string
+/* ============================ 炉次组炉排产 ============================ */
+
+/** 组炉判定需要的最小退火记录字段 */
+export type ScheduleAnneal = Pick<Anneal, 'pieceId' | 'state' | 'curveSeg' | 'inAt'>
+
+/** 已建炉次排产所需字段（用于窑位 / 时间窗判重；已出炉炉次已释放窑位，不参与判重） */
+export interface CommittedBatch {
+  id: string
+  kilnCode: string
+  state: Anneal['state']
+  inAt: string
+  outAt: string
+  curveSeg: CurveSeg
+  slots: string[]
+  /** 炉内最厚件壁厚（mm），用于估算未出炉炉次的预计出炉时间；缺省按 4 mm */
+  maxWallMm?: number
+}
+
+export interface BatchPlanResult {
+  /** 是否排得下：存在候选且容量不超限、窑位也够（无作品被退回下一炉） */
+  ok: boolean
+  /** 候选作品 pieceId 列表（曲线相同且时间能对上） */
+  candidateIds: string[]
+  /** 实际装入本炉的 pieceId 列表（受容量 / 窑位限制截断后） */
+  loadedIds: string[]
+  /** 排不下、退回队列等下一炉的 pieceId 列表 */
+  queuedIds: string[]
+  /** 建议分配的窑位组（与 loadedIds 一一对应） */
+  slots: string[]
   message: string
 }
 
-/**
- * 窑位占用判重：同一窑位、时间窗重叠即为冲突。
- * excludeAnnealId 用于编辑场景排除自身。
- */
-export function checkSlotConflict(
-  existing: Anneal[],
-  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
-  wallThicknessOf: (pieceId: string) => number,
-  excludeAnnealId = '',
-): SlotConflict {
-  const ownThickness = wallThicknessOf(candidate.pieceId)
-  const ownWindow = annealWindow(candidate, ownThickness)
-
-  for (const row of existing) {
-    if (row.id === excludeAnnealId) continue
-    if (row.kilnSlot !== candidate.kilnSlot) continue
-    const otherWindow = annealWindow(row, wallThicknessOf(row.pieceId))
-    if (windowsOverlap(ownWindow, otherWindow)) {
-      return {
-        conflict: true,
-        withPieceId: row.pieceId,
-        withAnnealId: row.id,
-        message: `窑位 ${candidate.kilnSlot} 在该时间窗内已被占用（${row.inAt} 起的 ${row.curveSeg} 段），请更换窑位或调整时间。`,
-      }
-    }
-  }
-  return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
+/** 一炉的退火时长：同炉作品壁厚可能不同，整炉按炉内最厚件的完整退火时长烧 */
+export function batchHours(wallThicknessList: number[]): number {
+  const maxThickness = wallThicknessList.length > 0 ? Math.max(...wallThicknessList) : 4
+  return totalAnnealHours(maxThickness)
 }
 
-/** 生成某台退火窑的窑位列表 */
+/** 已建炉次的时间窗：[入窑, 出炉]；未出炉按入窑 + 炉内最厚件理论时长估算 */
+export function committedWindowOf(batch: CommittedBatch): [number, number] {
+  const start = parseAt(batch.inAt)
+  if (Number.isNaN(start)) return [Number.NaN, Number.NaN]
+  const end = parseAt(batch.outAt)
+  if (!Number.isNaN(end) && end > start) return [start, end]
+  return [start, start + batchHours([batch.maxWallMm ?? 4]) * 3600 * 1000]
+}
+
+/**
+ * 判断某件待入窑作品能否并入指定炉次：
+ * 曲线必须相同，且其期望（最早可）入窑时间不晚于炉次计划入窑时间（时间能对上）。
+ */
+export function canJoinBatch(
+  waiting: ScheduleAnneal,
+  plan: { curveSeg: CurveSeg; inAt: string },
+): boolean {
+  if (waiting.state !== '待入窑' || waiting.curveSeg !== plan.curveSeg) return false
+  const readyAt = parseAt(waiting.inAt)
+  const startAt = parseAt(plan.inAt)
+  if (Number.isNaN(readyAt) || Number.isNaN(startAt)) return false
+  return readyAt <= startAt
+}
+
+/** 从待入窑队列里挑出能并入指定炉次的作品（保持入队顺序） */
+export function selectBatchCandidates(waiting: ScheduleAnneal[], plan: { curveSeg: CurveSeg; inAt: string }): ScheduleAnneal[] {
+  return waiting.filter((row) => canJoinBatch(row, plan))
+}
+
+/** 下一炉最早可开炉时间：所有冲突在烧炉次预计出炉时间的最大值（端点相接即可开炉） */
+export function suggestNextBatchStart(blocking: CommittedBatch[]): string | null {
+  const ends = blocking.map((row) => committedWindowOf(row)[1]).filter((value) => !Number.isNaN(value))
+  if (ends.length === 0) return null
+  return toLocalInput(new Date(Math.max(...ends)))
+}
+
+/**
+ * 为新一炉做组炉排产：
+ * - 装载容量按件数封顶，超出容量的候选退回队列等下一炉；
+ * - 窑位不得与同窑、尚未出炉且时间窗重叠的炉次冲突，绝不挤占在烧炉次；
+ * - 窑位不够时只装分得下的部分，其余排队，并提示下一炉可开炉时间。
+ */
+export function planBatch(
+  kilnCode: string,
+  capacity: number,
+  curveSeg: CurveSeg,
+  inAt: string,
+  waiting: ScheduleAnneal[],
+  committed: CommittedBatch[],
+  wallThicknessOf: (pieceId: string) => number,
+  excludeBatchId = '',
+): BatchPlanResult {
+  const candidates = selectBatchCandidates(waiting, { curveSeg, inAt })
+  const candidateIds = candidates.map((row) => row.pieceId)
+  const capacityLimit = Math.max(1, Math.floor(capacity))
+  const capped = candidates.slice(0, capacityLimit)
+  const cappedIds = capped.map((row) => row.pieceId)
+
+  const startMs = parseAt(inAt)
+  const hours = batchHours(capped.map((row) => wallThicknessOf(row.pieceId)))
+  const window: [number, number] = [startMs, Number.isNaN(startMs) ? Number.NaN : startMs + hours * 3600 * 1000]
+
+  // 同窑、尚未出炉、时间窗重叠的炉次占用的窑位一律不可用（不挤掉已经入窑的那炉）
+  const blocking = committed.filter(
+    (row) =>
+      row.id !== excludeBatchId &&
+      row.kilnCode === kilnCode &&
+      row.state !== '已出炉' &&
+      windowsOverlap(window, committedWindowOf(row)),
+  )
+  const blockedSlots = new Set<string>()
+  blocking.forEach((row) => row.slots.forEach((slot) => blockedSlots.add(slot)))
+
+  const freeSlots = kilnSlots(kilnCode).filter((slot) => !blockedSlots.has(slot))
+  const loaded = capped.filter((_, index) => index < freeSlots.length)
+  const loadedIds = loaded.map((row) => row.pieceId)
+  const slots = loadedIds.map((_, index) => freeSlots[index])
+
+  const overflowByCapacity = candidateIds.length > capacityLimit
+  const shortBySlots = cappedIds.length > loadedIds.length
+  const ok = candidateIds.length > 0 && !overflowByCapacity && !shortBySlots
+
+  let message: string
+  if (candidateIds.length === 0) {
+    message = `该时段没有曲线为「${curveSeg}」且时间能对上的待入窑作品，空窑不必照烧。`
+  } else if (overflowByCapacity) {
+    message = `本炉容量 ${capacityLimit} 件封顶，候选 ${candidateIds.length} 件；先装 ${loadedIds.length} 件，其余 ${
+      candidateIds.length - loadedIds.length
+    } 件排队等下一炉。`
+  } else if (shortBySlots) {
+    message = `窑位被在烧炉次占用，本炉只能装 ${loadedIds.length}/${cappedIds.length} 件；建议下一炉 ${
+      suggestNextBatchStart(blocking) ?? '稍后'
+    } 开炉，剩余作品先排队，不挤占已入窑炉次。`
+  } else {
+    message = `可并炉 ${loadedIds.length} 件，共用窑位 ${slots.join('、')}。`
+  }
+
+  return {
+    ok,
+    candidateIds,
+    loadedIds,
+    queuedIds: candidateIds.filter((id) => !loadedIds.includes(id)),
+    slots,
+    message,
+  }
+}
+
+/** 生成某台退火窑的窑位列表（3×3 共 9 格） */
 export function kilnSlots(kilnCode: string): string[] {
   const rows = ['A', 'B', 'C']
   const cols = [1, 2, 3]

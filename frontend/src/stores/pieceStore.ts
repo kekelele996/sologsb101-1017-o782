@@ -18,6 +18,7 @@ import {
   removePiece,
   removeStep,
   reorderSteps,
+  requeueOpenAnnealsForPiece,
   syncPieceState,
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
@@ -181,6 +182,14 @@ export const usePieceStore = defineStore('piece', () => {
       state: draft.state,
     })
     revision.value += 1
+    // 壁厚改动会改变退火时长：尚未入窑的安排退回待入窑重新确认并组炉，已入窑的按原样烧完
+    if (draft.wallThicknessMm !== existing.wallThicknessMm) {
+      const requeued = await requeueOpenAnnealsForPiece(pieceId)
+      lastMessage.value =
+        requeued > 0
+          ? `壁厚已改动，该作品 ${requeued} 条未入窑的退火安排已退回待入窑重排；已入窑炉次按原样烧完。`
+          : '壁厚已改动；该作品没有未入窑的退火安排需要重排，已入窑炉次按原样烧完。'
+    }
   }
 
   async function deletePiece(pieceId: string): Promise<void> {

@@ -9,6 +9,7 @@ import type { GlassBatch } from '../types/batch'
 import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
+import type { KilnBatch } from '../types/kilnBatch'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
@@ -67,8 +68,21 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     }
   }
-  const keys: Array<keyof DatabaseSnapshot> = ['furnaces', 'batches', 'pieces', 'steps', 'anneals', 'inspects']
+  const keys: Array<keyof DatabaseSnapshot> = [
+    'furnaces',
+    'batches',
+    'pieces',
+    'steps',
+    'kilnBatches',
+    'anneals',
+    'inspects',
+  ]
   for (const key of keys) {
+    if (key === 'kilnBatches' && !Array.isArray(data[key])) {
+      // 兼容 v2 旧存档：没有炉次表时按空炉次处理（导入后历史退火需手工重排）
+      ;(data as Partial<DatabaseSnapshot>).kilnBatches = []
+      continue
+    }
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
@@ -84,6 +98,7 @@ export function buildScheduleCsv(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  kilnBatches: KilnBatch[] = [],
 ): string {
   const header = [
     '作品名',
@@ -98,6 +113,7 @@ export function buildScheduleCsv(
     '已完成工序',
     '累计工时(分钟)',
     '退火记录数',
+    '退火窑炉次',
     '退火窑位',
     '退火状态',
     '理论退火时长',
@@ -111,6 +127,10 @@ export function buildScheduleCsv(
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
+    const latestKilnBatch =
+      latestAnneal && latestAnneal.batchId !== ''
+        ? kilnBatches.find((row) => row.id === latestAnneal.batchId)
+        : undefined
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
     lines.push(
@@ -127,7 +147,12 @@ export function buildScheduleCsv(
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
-        latestAnneal?.kilnSlot ?? '—',
+        latestKilnBatch
+          ? `${latestKilnBatch.kilnCode} 第${latestKilnBatch.seq}炉`
+          : latestAnneal?.state === '待入窑'
+            ? '排队中'
+            : '—',
+        latestAnneal?.kilnSlot || '—',
         latestAnneal?.state ?? '—',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
         pieceInspects.length,
@@ -148,9 +173,14 @@ export function exportScheduleCsvFile(
   steps: Step[],
   anneals: Anneal[],
   inspects: Inspect[],
+  kilnBatches: KilnBatch[] = [],
 ): string {
   const filename = `玻璃窑务排产汇总-${stampSuffix()}.csv`
-  download(filename, buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects), 'text/csv;charset=utf-8')
+  download(
+    filename,
+    buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects, kilnBatches),
+    'text/csv;charset=utf-8',
+  )
   return filename
 }
 
@@ -174,6 +204,7 @@ export function buildStepCardText(
   furnace: Furnace | undefined,
   steps: Step[],
   anneals: Anneal[],
+  kilnBatches: KilnBatch[] = [],
 ): string {
   const lines: string[] = []
   lines.push(`【工序卡片】${piece.name}（${piece.craft} · ${piece.artist} · ${piece.state}）`)
@@ -200,7 +231,9 @@ export function buildStepCardText(
   if (anneals.length > 0) {
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      const kb = row.batchId !== '' ? kilnBatches.find((item) => item.id === row.batchId) : undefined
+      const place = kb ? `${kb.kilnCode} 第${kb.seq}炉 ${row.kilnSlot}` : row.kilnSlot || '排队中'
+      lines.push(`  ${place} · ${row.curveSeg} · ${row.inAt || '待排'} → ${row.outAt || '未出炉'} · ${row.state}`)
     })
   }
   return lines.join('\n')

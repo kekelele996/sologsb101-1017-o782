@@ -118,7 +118,7 @@ async function handleSubmit(): Promise<void> {
       return
     }
     await pieceStore.updatePiece(editingId.value, { ...form })
-    ElMessage.success('作品信息已更新')
+    ElMessage.success(pieceStore.lastMessage.includes('退回') ? pieceStore.lastMessage : '作品信息已更新')
     dialogVisible.value = false
   } finally {
     submitting.value = false
@@ -312,7 +312,7 @@ function handleFilterChange(key: string, value: string): void {
           show-icon
           :closable="false"
           :title="designCheck.message"
-          description="壁厚会直接决定退火时长：升温与缓冷按温差/速率换算，保温按每 5 mm 壁厚 1.2 小时换算。"
+          description="壁厚会直接决定退火时长：升温与缓冷按温差/速率换算，保温按每 5 mm 壁厚 1.2 小时换算。改动壁厚后，尚未入窑的退火安排会退回待入窑重新确认并组炉，已经入窑的炉次按原样烧完。"
         />
       </el-form>
       <template #footer>

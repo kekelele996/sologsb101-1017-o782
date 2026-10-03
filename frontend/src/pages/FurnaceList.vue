@@ -15,6 +15,9 @@ import {
   FUEL_TYPE_OPTIONS,
   FURNACE_STATE_OPTIONS,
   FURNACE_TYPE_OPTIONS,
+  DEFAULT_ANNEAL_CAPACITY,
+  MAX_ANNEAL_CAPACITY,
+  MIN_ANNEAL_CAPACITY,
   type FuelType,
   type Furnace,
   type FurnaceDraft,
@@ -46,6 +49,7 @@ const furnaceForm = reactive<FurnaceDraft>({
   maxTempC: 1250,
   fuelType: '燃气',
   state: '停窑',
+  loadCapacity: DEFAULT_ANNEAL_CAPACITY,
 })
 
 const batchForm = reactive<GlassBatchDraft>({
@@ -63,6 +67,7 @@ const furnaceRules: FormRules<FurnaceDraft> = {
   maxTempC: [{ required: true, message: '请填写最高温度', trigger: 'blur' }],
   fuelType: [{ required: true, message: '请选择燃料类型', trigger: 'change' }],
   state: [{ required: true, message: '请选择运行状态', trigger: 'change' }],
+  loadCapacity: [{ required: true, message: '请填写每炉装载容量', trigger: 'blur' }],
 }
 
 const batchRules: FormRules<GlassBatchDraft> = {
@@ -104,6 +109,7 @@ function openCreateFurnace(): void {
     maxTempC: 1250,
     fuelType: '燃气' as FuelType,
     state: '停窑' as FurnaceState,
+    loadCapacity: DEFAULT_ANNEAL_CAPACITY,
   })
   furnaceDialog.value = true
 }
@@ -116,6 +122,7 @@ function openEditFurnace(row: Furnace): void {
     maxTempC: row.maxTempC,
     fuelType: row.fuelType,
     state: row.state,
+    loadCapacity: row.loadCapacity,
   })
   furnaceDialog.value = true
 }
@@ -333,6 +340,12 @@ function handleFurnaceFilter(key: string, value: string): void {
         <el-table-column label="最高温度" width="110" align="right">
           <template #default="{ row }">{{ row.maxTempC }} ℃</template>
         </el-table-column>
+        <el-table-column label="装载容量" width="120" align="right">
+          <template #default="{ row }">
+            <el-tag v-if="row.type === '退火窑'" size="small" type="primary">{{ row.loadCapacity }} 件/炉</el-tag>
+            <span v-else class="cell-sub">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="料液批次" width="110" align="right">
           <template #default="{ row }">{{ store.statOf(row.id).batchCount }} 批</template>
         </el-table-column>
@@ -472,12 +485,29 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item v-if="furnaceForm.type === '退火窑'" label="装载容量" prop="loadCapacity">
+          <el-input-number
+            v-model="furnaceForm.loadCapacity"
+            :min="MIN_ANNEAL_CAPACITY"
+            :max="MAX_ANNEAL_CAPACITY"
+            :step="1"
+            style="width: 220px"
+          />
+          <span class="cell-sub" style="margin-left: 10px">件/炉，组炉时按件数封顶，排不下的先排队等下一炉</span>
+        </el-form-item>
         <el-alert
           v-if="furnaceForm.type === '退火窑'"
           type="success"
           show-icon
           :closable="false"
-          title="退火窑保存后会自动进入窑位池（A1–C3 共 9 个窑位），可在退火编排页分配。"
+          title="退火窑保存后会自动进入窑位池（A1–C3 共 9 个窑位）；同一炉作品曲线相同、时间能对上时并炉，共用一组窑位。"
+        />
+        <el-alert
+          v-else
+          type="info"
+          show-icon
+          :closable="false"
+          title="熔化炉 / 坩埚炉不按炉次退火，装载容量仅对退火窑生效。"
         />
       </el-form>
       <template #footer>

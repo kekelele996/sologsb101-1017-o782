@@ -6,6 +6,7 @@ import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Furnace, FurnaceDraft, FurnaceState, FurnaceType } from '../types/furnace'
+import { DEFAULT_ANNEAL_CAPACITY } from '../types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '../types/batch'
 import {
   DB_SCHEMA_VERSION,
@@ -46,6 +47,13 @@ const EMPTY_STAT: Omit<FurnaceStat, 'furnaceId'> = {
   totalRemainKg: 0,
   lowCount: 0,
   pieceCount: 0,
+}
+
+/** 装载容量只对退火窑有意义；非退火窑固定为默认值 */
+function normalizeCapacity(draft: FurnaceDraft, fallback = DEFAULT_ANNEAL_CAPACITY): number {
+  if (draft.type !== '退火窑') return DEFAULT_ANNEAL_CAPACITY
+  if (!Number.isFinite(draft.loadCapacity) || draft.loadCapacity <= 0) return fallback
+  return Math.max(1, Math.floor(draft.loadCapacity))
 }
 
 let subscribed = false
@@ -159,6 +167,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
       maxTempC: draft.maxTempC,
       fuelType: draft.fuelType,
       state: draft.state,
+      loadCapacity: normalizeCapacity(draft),
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -166,7 +175,9 @@ export const useFurnaceStore = defineStore('furnace', () => {
     await putFurnace(row)
     revision.value += 1
     lastMessage.value =
-      row.type === '退火窑' ? `已新建退火窑「${row.code}」，窑位已进入窑位池` : `已新建窑炉「${row.code}」，可挂料液批次`
+      row.type === '退火窑'
+        ? `已新建退火窑「${row.code}」，每炉最多装 ${row.loadCapacity} 件，窑位已进入窑位池`
+        : `已新建窑炉「${row.code}」，可挂料液批次`
     return row
   }
 
@@ -180,6 +191,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
       maxTempC: draft.maxTempC,
       fuelType: draft.fuelType,
       state: draft.state,
+      loadCapacity: normalizeCapacity(draft, existing.loadCapacity),
     })
     revision.value += 1
   }
